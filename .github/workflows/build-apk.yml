@@ -1,0 +1,236 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      use_qnn:
+        description: "Build với onnxruntime-android-qnn (thử NPU Qualcomm; APK lớn hơn)"
+        type: boolean
+        default: false
+      use_billing:
+        description: "Build với Google Play Billing thật (bán credits / gói Pro); mặc định dùng bản stub"
+        type: boolean
+        default: false
+      use_litertlm:
+        description: "Build với LiteRT-LM thật (model .litertlm: Gemma 3n / Gemma 4, GPU, hiểu ảnh trên máy); mặc định dùng bản stub"
+        type: boolean
+        default: false
+      litertlm_version:
+        description: "Phiên bản com.google.ai.edge.litertlm:litertlm-android (để trống = latest.release; hãy ghim sau khi build thử OK)"
+        type: string
+        default: ""
+      use_integrity:
+        description: "Bật Play Integrity thật (-PuseIntegrity=true): app chứng thực thiết bị với máy chủ khi máy chủ đòi (403 integrity_required)"
+        type: boolean
+        default: false
+      integrity_cloud_project:
+        description: "Số dự án Google Cloud (chỉ chữ số) cho Play Integrity; trống = chưa cấu hình"
+        type: string
+        default: ""
+      play_release:
+        description: "Build theo yêu cầu Google Play: compileSdk/targetSdk 36 (Play bắt buộc từ 31/8/2026). Mặc định tắt: bản tester vẫn nhắm 34"
+        type: boolean
+        default: false
+      sdcpp_ref:
+        description: "Nhánh/tag của stable-diffusion.cpp để biên dịch sd-server (nên ghim sang tag đã thử thành công)"
+        type: string
+        default: "master"
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test máy chủ trung gian (credits, định tuyến, hoàn credits khi lỗi)
+        run: python backend/test_server.py
+      - name: Kiểm tra tĩnh mã Kotlin (ngoặc, import, vm./st., enum) - bắt lỗi tham chiếu sớm, trước khi gradle chạy
+        run: python tools/static_check.py
+      - name: Kiểm chứng số học và luật bằng bản port Python (tông màu, LUT, bầu trời, planner, hình học...)
+        run: |
+          pip install numpy scipy opencv-python-headless onnxruntime
+          for f in tools/verify_ports/*.py; do echo "=== $f"; python "$f" || exit 1; done
+
+  jvm-check:
+    # R19: biên dịch Kotlin THẬT (kotlinc đi kèm Gradle) + chạy mọi test JVM với stub nền tảng, không cần Android SDK. Chạy độc lập với job build
+    # để lỗi biên dịch lộ ra sớm và rẻ; KHÔNG thay cho job build (stub không kiểm được chữ ký Compose/ORT/MediaPipe thật). Xem tools/jvm_check/README.md
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+      - name: Cài numpy/scipy/opencv cho bản port Python
+        run: pip install numpy scipy opencv-python-headless onnxruntime
+      - name: Biên dịch thật 2 biến thể + JUnit + kiểm tra tĩnh + backend + bản port
+        run: tools/jvm_check/run_all.sh
+
+  # Biên dịch sd-server (stable-diffusion.cpp, giấy phép MIT) cho Android arm64 để tạo/chỉnh ảnh NGAY TRÊN MÁY.
+  # Job này TÙY CHỌN: lỗi thì APK vẫn build bình thường, chỉ thiếu tính năng "tạo ảnh trên máy".
+  build-sd-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - name: Biên dịch sd-server
+        env:
+          SDCPP_REF: ${{ github.event.inputs.sdcpp_ref || 'master' }}
+        run: |
+          set -euo pipefail
+          git clone --recursive --depth 1 --branch "$SDCPP_REF" https://github.com/leejet/stable-diffusion.cpp sdcpp
+          COMMIT=$(git -C sdcpp rev-parse HEAD)
+          echo "stable-diffusion.cpp commit: $COMMIT" | tee -a "$GITHUB_STEP_SUMMARY"
+          NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
+          test -d "$NDK"
+          # Dùng tập lệnh ARMv8-A nền (chạy được trên mọi chip arm64, kể cả cũ). Bản tối ưu dotprod/i8mm cho máy mạnh: việc sau.
+          cmake -S sdcpp -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_EXAMPLES=ON \
+            -DGGML_OPENMP=OFF -DGGML_NATIVE=OFF \
+            -DCMAKE_C_FLAGS="-march=armv8-a" -DCMAKE_CXX_FLAGS="-march=armv8-a" \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,-z,max-page-size=16384" -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384"
+          # ↑ R31: căn chỉnh 16 KB (Google Play bắt buộc với app nhắm Android 15+). NDK r28+ đã mặc định như vậy; r27 trở xuống thì cần cờ này.
+          cmake --build build --target sd-server -j4
+          BIN=$(find build -name sd-server -type f | head -n1)
+          test -n "$BIN"
+          mkdir -p out
+          cp "$BIN" out/libsd_server.so
+          file out/libsd_server.so | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sd-server-arm64
+          path: out/libsd_server.so
+          if-no-files-found: error
+
+  build:
+    needs: [build-sd-server]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    env:
+      PLAY_RELEASE: ${{ github.event.inputs.play_release || 'false' }}
+      # cùng cờ -P với bước build (dùng cho bước in phiên bản thư viện)
+      PFLAGS: -PuseQnn=${{ github.event.inputs.use_qnn || 'false' }} -PuseBilling=${{ github.event.inputs.use_billing || 'false' }} -PuseLiteRtLm=${{ github.event.inputs.use_litertlm || 'false' }}${{ github.event.inputs.litertlm_version != '' && format(' -PlitertlmVersion={0}', github.event.inputs.litertlm_version) || '' }} -PuseIntegrity=${{ github.event.inputs.use_integrity || 'false' }}${{ github.event.inputs.integrity_cloud_project != '' && format(' -PintegrityCloudProject={0}', github.event.inputs.integrity_cloud_project) || '' }}${{ github.event.inputs.play_release == 'true' && ' -PplayRelease=true' || '' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lấy sd-server đã biên dịch (nếu có)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: sd-server-arm64
+          path: app/src/main/jniLibs/arm64-v8a
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # Chấp nhận license Android SDK (phòng khi runner thiếu platform/build-tools)
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      # Cache toàn bộ ~/.gradle (dependencies, wrapper, build cache) giữa các lần chạy
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          # R31: bản play_release (API 36) cần AGP 8.9.1 ⇒ Gradle >= 8.11.1; bản tester giữ 8.7 như cũ
+          gradle-version: ${{ github.event.inputs.play_release == 'true' && '8.14.3' || '8.7' }}
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+      # Kiểm thử logic (planner VI/EN, GenIntent, Curves, Blend, định tuyến, hồ sơ hiệu năng). Lỗi test không chặn APK.
+      - name: Unit tests
+        continue-on-error: true
+        run: gradle :app:testDebugUnitTest --build-cache --stacktrace
+
+      - name: Build debug APK
+        run: gradle :app:assembleDebug --build-cache --stacktrace -PuseQnn=${{ github.event.inputs.use_qnn || 'false' }} -PuseBilling=${{ github.event.inputs.use_billing || 'false' }} -PuseLiteRtLm=${{ github.event.inputs.use_litertlm || 'false' }}${{ github.event.inputs.litertlm_version != '' && format(' -PlitertlmVersion={0}', github.event.inputs.litertlm_version) || '' }} -PuseIntegrity=${{ github.event.inputs.use_integrity || 'false' }}${{ github.event.inputs.integrity_cloud_project != '' && format(' -PintegrityCloudProject={0}', github.event.inputs.integrity_cloud_project) || '' }} -PversionCode=${{ github.run_number }}${{ github.event.inputs.play_release == 'true' && ' -PplayRelease=true' || '' }}
+
+      # R31: Google Play chặn bản cập nhật có thư viện native căn chỉnh 4 KB (hạn 01/02/2027). Không chặn APK tester, chỉ báo vào Summary.
+      - name: Kiểm tra căn chỉnh 16 KB của thư viện native trong APK
+        continue-on-error: true
+        run: python3 tools/check_16kb.py app/build/outputs/apk/debug/*.apk | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # R32: in phiên bản THẬT của các thư viện chính đã được Gradle giải quyết (kể cả `latest.release` của LiteRT-LM) để ghim bằng ô `litertlm_version`
+      # mà không phải đoán số phiên bản. Chỉ báo vào Summary, không chặn.
+      - name: Ghi phiên bản thư viện đã giải quyết
+        continue-on-error: true
+        run: |
+          {
+            echo "### Phiên bản thư viện đã giải quyết (debugRuntimeClasspath)"
+            echo '```'
+            gradle :app:dependencies --configuration debugRuntimeClasspath $PFLAGS 2>/dev/null \
+              | grep -E 'litertlm|onnxruntime|mediapipe|billing|play:integrity|androidx.compose.ui:ui:|androidx.activity:activity' \
+              | sed -E 's/^[| +\\-]*//' | sort -u
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AIPhotoStudio-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+  # R32: luôn dựng thử bản theo yêu cầu Google Play (API 36 + AGP 8.9.1 + Gradle 8.14.3) ở job RIÊNG, KHÔNG chặn: lỗi ở đây không làm hỏng bản tester,
+  # nhưng mỗi lần chạy bạn đều có kết quả (đỏ/xanh + log + bước kiểm 16 KB) mà không phải bật tay `play_release`. Bỏ qua khi chính lần chạy này đã bật `play_release`.
+  build-play:
+    needs: [build-sd-server]
+    if: ${{ !cancelled() && github.event.inputs.play_release != 'true' }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    env:
+      PLAY_RELEASE: 'true'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lấy sd-server đã biên dịch (nếu có)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: sd-server-arm64
+          path: app/src/main/jniLibs/arm64-v8a
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+      - name: Build APK theo yêu cầu Google Play (API 36)
+        run: gradle :app:assembleDebug --build-cache --stacktrace -PplayRelease=true -PversionCode=${{ github.run_number }}
+
+      - name: Kiểm tra căn chỉnh 16 KB của thư viện native trong APK
+        continue-on-error: true
+        run: python3 tools/check_16kb.py app/build/outputs/apk/debug/*.apk | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AIPhotoStudio-play-api36-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
