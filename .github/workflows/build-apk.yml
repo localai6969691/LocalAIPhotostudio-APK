@@ -44,19 +44,125 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  repo-check:
+    # R34c: đối chiếu repo với REPO_MANIFEST.txt để biết CHÍNH XÁC tệp/thư mục nào thiếu (tải lên GitHub chưa đủ). Không chặn các job khác,
+    # trừ khi thiếu cả tệp build thiết yếu (khi đó APK cũng không build được).
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Giải nén gói zip dự án nếu có ở gốc repo (chỉ cần up zip lên là đủ)
+        run: |
+          # R34d: GitHub chỉ đọc file workflow từ chính repo, còn MỌI thứ khác có thể nằm trong zip. Zip ghi đè lên workspace (zip thắng tệp lẻ cũ);
+          # chịu được zip có/không có thư mục bọc; nhiều zip thì giải nén theo thứ tự tên (sort -V), zip tên "lớn" nhất thắng.
+          shopt -s nullglob
+          found=0
+          while IFS= read -r -d '' z; do
+            [ -n "$z" ] || continue
+            listing=$(unzip -l "$z" 2>/dev/null || true)
+            if ! grep -qE '(^|[ /])settings\.gradle\.kts$' <<<"$listing"; then
+              echo "Bỏ qua $z (không phải gói dự án: không có settings.gradle.kts)"; continue
+            fi
+            found=$((found+1))
+            echo "Giải nén $z vào workspace (ghi đè tệp trùng)"
+            tmp=$(mktemp -d)
+            unzip -oq "$z" -d "$tmp"
+            rm -rf "$tmp/__MACOSX"
+            sg=$(find "$tmp" -maxdepth 3 -name settings.gradle.kts -printf '%d %p\n' | sort -n | head -n1 | cut -d' ' -f2-)
+            root=$(dirname "$sg")
+            if [ -f "$root/.github/workflows/build-apk.yml" ] && ! cmp -s "$root/.github/workflows/build-apk.yml" .github/workflows/build-apk.yml; then
+              echo "::notice title=Workflow trong repo khác bản trong zip::GitHub chỉ đọc workflow từ chính repo, nên bản trong zip chưa có hiệu lực. Hãy thay .github/workflows/build-apk.yml trong repo bằng bản trong zip (hoặc bản build-apk.yml đi kèm) để dùng bản mới nhất."
+            fi
+            rm -rf "$root/.github"
+            cp -a "$root"/. ./
+            rm -rf "$tmp"
+          done < <(printf '%s\0' ./*.zip | sort -zV)
+          if [ "$found" -eq 0 ]; then echo "Không có gói zip dự án ở gốc repo - dùng nguyên nội dung repo."; fi
+      - name: Đối chiếu repo với danh sách tệp của gói dự án
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, sys
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          out = []
+          def say(s=""):
+              print(s); out.append(s)
+          essential = ["settings.gradle.kts", "build.gradle.kts", "app/build.gradle.kts", "app/src/main/AndroidManifest.xml"]
+          optional = {"backend": "test máy chủ trung gian", "tools": "kiểm tra tĩnh, bản port Python, jvm-check", "app/src/test": "JUnit"}
+          miss_ess = [f for f in essential if not os.path.isfile(f)]
+          for d, why in optional.items():
+              if not os.path.isdir(d):
+                  print(f"::warning title=Repo thiếu thư mục {d}/::Không có {d}/ trong repo ({why}). Hãy tải thư mục này lên (cùng cấp với app/). Các bước cần nó sẽ được bỏ qua.")
+          if not os.path.isfile("REPO_MANIFEST.txt"):
+              say("## Repo check\nKhông có `REPO_MANIFEST.txt` ở gốc repo - chỉ kiểm được thư mục cấp 1.")
+          else:
+              rows = [l.split(" ", 2) for l in open("REPO_MANIFEST.txt", encoding="utf-8").read().splitlines() if l.strip()]
+              missing, changed = [], []
+              for sha, size, path in rows:
+                  if not os.path.isfile(path): missing.append(path); continue
+                  if hashlib.sha1(open(path, "rb").read()).hexdigest() != sha: changed.append(path)
+              say(f"## Repo check\n- Danh sách gói: {len(rows)} tệp | thiếu trong repo: **{len(missing)}** | khác bản đóng gói: {len(changed)}")
+              if missing:
+                  tops = {}
+                  for m in missing: tops.setdefault(m.split("/")[0], []).append(m)
+                  say("- Thiếu theo thư mục cấp 1: " + ", ".join(f"`{k}/` ({len(v)})" for k, v in sorted(tops.items())))
+                  for k, v in sorted(tops.items()):
+                      say(f"  - `{k}`: " + ", ".join(f"`{x}`" for x in v[:12]) + (" …" if len(v) > 12 else ""))
+                  print("::warning title=Repo thiếu " + str(len(missing)) + " tệp so với gói dự án::" + "; ".join(f"{k}/ ({len(v)})" for k, v in sorted(tops.items())) + ". Tải đủ các thư mục này lên repo (xem Summary của run).")
+              if changed:
+                  say("- Khác bản đóng gói (có thể bạn đã sửa, hoặc tải lên bản cũ): " + ", ".join(f"`{x}`" for x in changed[:15]) + (" …" if len(changed) > 15 else ""))
+          if summary:
+              open(summary, "a", encoding="utf-8").write("\n".join(out) + "\n")
+          if miss_ess:
+              print("::error title=Thiếu tệp build thiết yếu::" + ", ".join(miss_ess))
+              sys.exit(1)
+          PY
+
   backend-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Giải nén gói zip dự án nếu có ở gốc repo (chỉ cần up zip lên là đủ)
+        run: |
+          # R34d: GitHub chỉ đọc file workflow từ chính repo, còn MỌI thứ khác có thể nằm trong zip. Zip ghi đè lên workspace (zip thắng tệp lẻ cũ);
+          # chịu được zip có/không có thư mục bọc; nhiều zip thì giải nén theo thứ tự tên (sort -V), zip tên "lớn" nhất thắng.
+          shopt -s nullglob
+          found=0
+          while IFS= read -r -d '' z; do
+            [ -n "$z" ] || continue
+            listing=$(unzip -l "$z" 2>/dev/null || true)
+            if ! grep -qE '(^|[ /])settings\.gradle\.kts$' <<<"$listing"; then
+              echo "Bỏ qua $z (không phải gói dự án: không có settings.gradle.kts)"; continue
+            fi
+            found=$((found+1))
+            echo "Giải nén $z vào workspace (ghi đè tệp trùng)"
+            tmp=$(mktemp -d)
+            unzip -oq "$z" -d "$tmp"
+            rm -rf "$tmp/__MACOSX"
+            sg=$(find "$tmp" -maxdepth 3 -name settings.gradle.kts -printf '%d %p\n' | sort -n | head -n1 | cut -d' ' -f2-)
+            root=$(dirname "$sg")
+            if [ -f "$root/.github/workflows/build-apk.yml" ] && ! cmp -s "$root/.github/workflows/build-apk.yml" .github/workflows/build-apk.yml; then
+              echo "::notice title=Workflow trong repo khác bản trong zip::GitHub chỉ đọc workflow từ chính repo, nên bản trong zip chưa có hiệu lực. Hãy thay .github/workflows/build-apk.yml trong repo bằng bản trong zip (hoặc bản build-apk.yml đi kèm) để dùng bản mới nhất."
+            fi
+            rm -rf "$root/.github"
+            cp -a "$root"/. ./
+            rm -rf "$tmp"
+          done < <(printf '%s\0' ./*.zip | sort -zV)
+          if [ "$found" -eq 0 ]; then echo "Không có gói zip dự án ở gốc repo - dùng nguyên nội dung repo."; fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Test máy chủ trung gian (credits, định tuyến, hoàn credits khi lỗi)
+        if: ${{ hashFiles('backend/test_server.py') != '' }}
         run: python backend/test_server.py
+      - name: Bỏ qua test máy chủ (repo không có backend/test_server.py)
+        if: ${{ hashFiles('backend/test_server.py') == '' }}
+        run: echo "::warning title=Bỏ qua test máy chủ::Repo không có backend/test_server.py - tải thư mục backend/ lên cùng cấp với app/ rồi chạy lại. Xem job repo-check."
       - name: Kiểm tra tĩnh mã Kotlin (ngoặc, import, vm./st., enum) - bắt lỗi tham chiếu sớm, trước khi gradle chạy
+        if: ${{ hashFiles('tools/static_check.py') != '' }}
         run: python tools/static_check.py
       - name: Kiểm chứng số học và luật bằng bản port Python (tông màu, LUT, bầu trời, planner, hình học...)
+        if: ${{ hashFiles('tools/verify_ports/*.py') != '' }}
         run: |
           pip install numpy scipy opencv-python-headless onnxruntime
           for f in tools/verify_ports/*.py; do echo "=== $f"; python "$f" || exit 1; done
@@ -68,6 +174,33 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - name: Giải nén gói zip dự án nếu có ở gốc repo (chỉ cần up zip lên là đủ)
+        run: |
+          # R34d: GitHub chỉ đọc file workflow từ chính repo, còn MỌI thứ khác có thể nằm trong zip. Zip ghi đè lên workspace (zip thắng tệp lẻ cũ);
+          # chịu được zip có/không có thư mục bọc; nhiều zip thì giải nén theo thứ tự tên (sort -V), zip tên "lớn" nhất thắng.
+          shopt -s nullglob
+          found=0
+          while IFS= read -r -d '' z; do
+            [ -n "$z" ] || continue
+            listing=$(unzip -l "$z" 2>/dev/null || true)
+            if ! grep -qE '(^|[ /])settings\.gradle\.kts$' <<<"$listing"; then
+              echo "Bỏ qua $z (không phải gói dự án: không có settings.gradle.kts)"; continue
+            fi
+            found=$((found+1))
+            echo "Giải nén $z vào workspace (ghi đè tệp trùng)"
+            tmp=$(mktemp -d)
+            unzip -oq "$z" -d "$tmp"
+            rm -rf "$tmp/__MACOSX"
+            sg=$(find "$tmp" -maxdepth 3 -name settings.gradle.kts -printf '%d %p\n' | sort -n | head -n1 | cut -d' ' -f2-)
+            root=$(dirname "$sg")
+            if [ -f "$root/.github/workflows/build-apk.yml" ] && ! cmp -s "$root/.github/workflows/build-apk.yml" .github/workflows/build-apk.yml; then
+              echo "::notice title=Workflow trong repo khác bản trong zip::GitHub chỉ đọc workflow từ chính repo, nên bản trong zip chưa có hiệu lực. Hãy thay .github/workflows/build-apk.yml trong repo bằng bản trong zip (hoặc bản build-apk.yml đi kèm) để dùng bản mới nhất."
+            fi
+            rm -rf "$root/.github"
+            cp -a "$root"/. ./
+            rm -rf "$tmp"
+          done < <(printf '%s\0' ./*.zip | sort -zV)
+          if [ "$found" -eq 0 ]; then echo "Không có gói zip dự án ở gốc repo - dùng nguyên nội dung repo."; fi
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -81,7 +214,11 @@ jobs:
       - name: Cài numpy/scipy/opencv cho bản port Python
         run: pip install numpy scipy opencv-python-headless onnxruntime
       - name: Biên dịch thật 2 biến thể + JUnit + kiểm tra tĩnh + backend + bản port
-        run: tools/jvm_check/run_all.sh
+        if: ${{ hashFiles('tools/jvm_check/run_all.sh') != '' }}
+        run: bash tools/jvm_check/run_all.sh
+      - name: Bỏ qua jvm-check (repo không có tools/jvm_check)
+        if: ${{ hashFiles('tools/jvm_check/run_all.sh') == '' }}
+        run: echo "::warning title=Bỏ qua jvm-check::Repo không có tools/jvm_check/run_all.sh - tải thư mục tools/ lên. Xem job repo-check."
 
   # Biên dịch sd-server (stable-diffusion.cpp, giấy phép MIT) cho Android arm64 để tạo/chỉnh ảnh NGAY TRÊN MÁY.
   # Job này TÙY CHỌN: lỗi thì APK vẫn build bình thường, chỉ thiếu tính năng "tạo ảnh trên máy".
@@ -132,6 +269,33 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Giải nén gói zip dự án nếu có ở gốc repo (chỉ cần up zip lên là đủ)
+        run: |
+          # R34d: GitHub chỉ đọc file workflow từ chính repo, còn MỌI thứ khác có thể nằm trong zip. Zip ghi đè lên workspace (zip thắng tệp lẻ cũ);
+          # chịu được zip có/không có thư mục bọc; nhiều zip thì giải nén theo thứ tự tên (sort -V), zip tên "lớn" nhất thắng.
+          shopt -s nullglob
+          found=0
+          while IFS= read -r -d '' z; do
+            [ -n "$z" ] || continue
+            listing=$(unzip -l "$z" 2>/dev/null || true)
+            if ! grep -qE '(^|[ /])settings\.gradle\.kts$' <<<"$listing"; then
+              echo "Bỏ qua $z (không phải gói dự án: không có settings.gradle.kts)"; continue
+            fi
+            found=$((found+1))
+            echo "Giải nén $z vào workspace (ghi đè tệp trùng)"
+            tmp=$(mktemp -d)
+            unzip -oq "$z" -d "$tmp"
+            rm -rf "$tmp/__MACOSX"
+            sg=$(find "$tmp" -maxdepth 3 -name settings.gradle.kts -printf '%d %p\n' | sort -n | head -n1 | cut -d' ' -f2-)
+            root=$(dirname "$sg")
+            if [ -f "$root/.github/workflows/build-apk.yml" ] && ! cmp -s "$root/.github/workflows/build-apk.yml" .github/workflows/build-apk.yml; then
+              echo "::notice title=Workflow trong repo khác bản trong zip::GitHub chỉ đọc workflow từ chính repo, nên bản trong zip chưa có hiệu lực. Hãy thay .github/workflows/build-apk.yml trong repo bằng bản trong zip (hoặc bản build-apk.yml đi kèm) để dùng bản mới nhất."
+            fi
+            rm -rf "$root/.github"
+            cp -a "$root"/. ./
+            rm -rf "$tmp"
+          done < <(printf '%s\0' ./*.zip | sort -zV)
+          if [ "$found" -eq 0 ]; then echo "Không có gói zip dự án ở gốc repo - dùng nguyên nội dung repo."; fi
 
       - name: Lấy sd-server đã biên dịch (nếu có)
         uses: actions/download-artifact@v4
@@ -201,6 +365,33 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Giải nén gói zip dự án nếu có ở gốc repo (chỉ cần up zip lên là đủ)
+        run: |
+          # R34d: GitHub chỉ đọc file workflow từ chính repo, còn MỌI thứ khác có thể nằm trong zip. Zip ghi đè lên workspace (zip thắng tệp lẻ cũ);
+          # chịu được zip có/không có thư mục bọc; nhiều zip thì giải nén theo thứ tự tên (sort -V), zip tên "lớn" nhất thắng.
+          shopt -s nullglob
+          found=0
+          while IFS= read -r -d '' z; do
+            [ -n "$z" ] || continue
+            listing=$(unzip -l "$z" 2>/dev/null || true)
+            if ! grep -qE '(^|[ /])settings\.gradle\.kts$' <<<"$listing"; then
+              echo "Bỏ qua $z (không phải gói dự án: không có settings.gradle.kts)"; continue
+            fi
+            found=$((found+1))
+            echo "Giải nén $z vào workspace (ghi đè tệp trùng)"
+            tmp=$(mktemp -d)
+            unzip -oq "$z" -d "$tmp"
+            rm -rf "$tmp/__MACOSX"
+            sg=$(find "$tmp" -maxdepth 3 -name settings.gradle.kts -printf '%d %p\n' | sort -n | head -n1 | cut -d' ' -f2-)
+            root=$(dirname "$sg")
+            if [ -f "$root/.github/workflows/build-apk.yml" ] && ! cmp -s "$root/.github/workflows/build-apk.yml" .github/workflows/build-apk.yml; then
+              echo "::notice title=Workflow trong repo khác bản trong zip::GitHub chỉ đọc workflow từ chính repo, nên bản trong zip chưa có hiệu lực. Hãy thay .github/workflows/build-apk.yml trong repo bằng bản trong zip (hoặc bản build-apk.yml đi kèm) để dùng bản mới nhất."
+            fi
+            rm -rf "$root/.github"
+            cp -a "$root"/. ./
+            rm -rf "$tmp"
+          done < <(printf '%s\0' ./*.zip | sort -zV)
+          if [ "$found" -eq 0 ]; then echo "Không có gói zip dự án ở gốc repo - dùng nguyên nội dung repo."; fi
 
       - name: Lấy sd-server đã biên dịch (nếu có)
         uses: actions/download-artifact@v4
