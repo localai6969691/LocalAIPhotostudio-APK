@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      use_all:
+        description: "R39: bật CÙNG LÚC mọi tích hợp thật trừ QNN (Play Billing + LiteRT-LM + Play Integrity) — một ô thay cho ba ô riêng; bản này dùng để thử đủ tính năng nhưng dịch vụ thật (Billing/Integrity) chỉ chạy khi đã cấu hình máy chủ + Play Console"
+        type: boolean
+        default: false
       use_qnn:
         description: "Build với onnxruntime-android-qnn (thử NPU Qualcomm; APK lớn hơn)"
         type: boolean
@@ -32,6 +36,10 @@ on:
         default: ""
       play_release:
         description: "Build theo yêu cầu Google Play: compileSdk/targetSdk 36 (Play bắt buộc từ 31/8/2026). Mặc định tắt: bản tester vẫn nhắm 34"
+        type: boolean
+        default: false
+      perf_r8:
+        description: "Job build-perf: dựng THÊM bản perf có R8 (thu nhỏ + tối ưu mã; -PperfMinify=true). Thử nghiệm: có thể lỗi lần đầu, khi đó tải artifact perf-r8-diagnostics để lấy missing_rules.txt"
         type: boolean
         default: false
       sdcpp_ref:
@@ -216,6 +224,40 @@ jobs:
       - name: Biên dịch thật 2 biến thể + JUnit + kiểm tra tĩnh + backend + bản port
         if: ${{ hashFiles('tools/jvm_check/run_all.sh') != '' }}
         run: bash tools/jvm_check/run_all.sh
+      - name: Kiểm tích hợp LiteRT-LM với MÃ NGUỒN THẬT của google-ai-edge/LiteRT-LM (không chặn)
+        # R40: stub LiteRT-LM tự viết từng đoán sai chữ ký (R34e). Bước này lấy mã Kotlin chính chủ từ GitHub, biên dịch cùng
+        # app/src/litertlmReal rồi chạy 12 kiểm tra trên lớp thật. Không chặn: nếu GitHub không tải được hoặc thư viện đổi API thì chỉ báo, nhưng
+        # một lần ĐỎ ở đây nghĩa là bản build bật LiteRT-LM (use_litertlm / use_all) rất có thể cũng đỏ ⇒ đừng gửi bản đó cho tester.
+        if: ${{ hashFiles('tools/jvm_check/real_litertlm/check_real_litertlm.sh') != '' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          {
+            echo "### Kiểm LiteRT-LM với mã nguồn thật"
+            echo '```'
+            bash tools/jvm_check/real_litertlm/check_real_litertlm.sh "${LITERTLM_TAG:-v0.19.1}" 2>&1 | tail -30
+            echo '```'
+          } > /tmp/real_litertlm_summary.md || true
+          cat /tmp/real_litertlm_summary.md | tee -a "$GITHUB_STEP_SUMMARY"
+          if grep -q "TẤT CẢ ĐẠT" /tmp/real_litertlm_summary.md; then echo "LiteRT-LM thật: đạt"; else echo "::warning title=LiteRT-LM thật::bài kiểm với mã nguồn thật không đạt hoặc không chạy được - xem Summary"; exit 1; fi
+      - name: Biên dịch app với AAR THẬT của Play Billing / Play Integrity / LiteRT-LM (không chặn)
+        # R41: sandbox của Claude không tải được AAR (Maven bị chặn) nên chưa từng biên dịch adapter với thư viện thật. Runner GitHub tải được:
+        # bước này lấy classes.jar thật từ Google Maven / Maven Central, biên dịch CẢ DỰ ÁN với chúng thay cho stub (vài phút, không cần Gradle),
+        # in phiên bản Kotlin metadata của AAR. Báo sớm lỗi chữ ký thật; lỗi ở đây = bản build bật use_billing / use_integrity / use_litertlm (hoặc use_all) rất có thể đỏ.
+        if: ${{ hashFiles('tools/jvm_check/real_aar/check_real_aars.sh') != '' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          BILLING_VERSION: ${{ vars.BILLING_VERSION }}
+          LITERTLM_VERSION: ${{ github.event.inputs.litertlm_version }}
+        run: |
+          set +e
+          bash tools/jvm_check/real_aar/check_real_aars.sh 2>&1 | tail -60 | tee /tmp/real_aar.txt
+          rc=${PIPESTATUS[0]}
+          { echo "### Biên dịch với AAR thật (Billing / Integrity / LiteRT-LM)"; echo '```'; cat /tmp/real_aar.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" = 0 ]; then echo "AAR thật: đạt"
+          elif [ "$rc" = 3 ]; then echo "::warning title=AAR thật::không tải được AAR nào (mạng?) - bỏ qua"
+          else echo "::warning title=AAR thật::LỖI biên dịch với thư viện thật - bản build bật cờ tương ứng có thể đỏ, xem Summary"; exit 1; fi
       - name: Bỏ qua jvm-check (repo không có tools/jvm_check)
         if: ${{ hashFiles('tools/jvm_check/run_all.sh') == '' }}
         run: echo "::warning title=Bỏ qua jvm-check::Repo không có tools/jvm_check/run_all.sh - tải thư mục tools/ lên. Xem job repo-check."
@@ -265,7 +307,7 @@ jobs:
     env:
       PLAY_RELEASE: ${{ github.event.inputs.play_release || 'false' }}
       # cùng cờ -P với bước build (dùng cho bước in phiên bản thư viện)
-      PFLAGS: -PuseQnn=${{ github.event.inputs.use_qnn || 'false' }} -PuseBilling=${{ github.event.inputs.use_billing || 'false' }} -PuseLiteRtLm=${{ github.event.inputs.use_litertlm || 'false' }}${{ github.event.inputs.litertlm_version != '' && format(' -PlitertlmVersion={0}', github.event.inputs.litertlm_version) || '' }} -PuseIntegrity=${{ github.event.inputs.use_integrity || 'false' }}${{ github.event.inputs.integrity_cloud_project != '' && format(' -PintegrityCloudProject={0}', github.event.inputs.integrity_cloud_project) || '' }}${{ github.event.inputs.play_release == 'true' && ' -PplayRelease=true' || '' }}
+      PFLAGS: -PuseQnn=${{ github.event.inputs.use_qnn || 'false' }} -PuseBilling=${{ (github.event.inputs.use_billing == 'true' || github.event.inputs.use_all == 'true') && 'true' || 'false' }}${{ vars.BILLING_VERSION != '' && format(' -PbillingVersion={0}', vars.BILLING_VERSION) || '' }} -PuseLiteRtLm=${{ (github.event.inputs.use_litertlm == 'true' || github.event.inputs.use_all == 'true') && 'true' || 'false' }}${{ github.event.inputs.litertlm_version != '' && format(' -PlitertlmVersion={0}', github.event.inputs.litertlm_version) || '' }} -PuseIntegrity=${{ (github.event.inputs.use_integrity == 'true' || github.event.inputs.use_all == 'true') && 'true' || 'false' }}${{ github.event.inputs.integrity_cloud_project != '' && format(' -PintegrityCloudProject={0}', github.event.inputs.integrity_cloud_project) || '' }}${{ github.event.inputs.play_release == 'true' && ' -PplayRelease=true' || '' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -326,7 +368,7 @@ jobs:
         run: gradle :app:testDebugUnitTest --build-cache --stacktrace
 
       - name: Build debug APK
-        run: gradle :app:assembleDebug --build-cache --stacktrace -PuseQnn=${{ github.event.inputs.use_qnn || 'false' }} -PuseBilling=${{ github.event.inputs.use_billing || 'false' }} -PuseLiteRtLm=${{ github.event.inputs.use_litertlm || 'false' }}${{ github.event.inputs.litertlm_version != '' && format(' -PlitertlmVersion={0}', github.event.inputs.litertlm_version) || '' }} -PuseIntegrity=${{ github.event.inputs.use_integrity || 'false' }}${{ github.event.inputs.integrity_cloud_project != '' && format(' -PintegrityCloudProject={0}', github.event.inputs.integrity_cloud_project) || '' }} -PversionCode=${{ github.run_number }}${{ github.event.inputs.play_release == 'true' && ' -PplayRelease=true' || '' }}
+        run: gradle :app:assembleDebug --build-cache --stacktrace -PuseQnn=${{ github.event.inputs.use_qnn || 'false' }} -PuseBilling=${{ (github.event.inputs.use_billing == 'true' || github.event.inputs.use_all == 'true') && 'true' || 'false' }}${{ vars.BILLING_VERSION != '' && format(' -PbillingVersion={0}', vars.BILLING_VERSION) || '' }} -PuseLiteRtLm=${{ (github.event.inputs.use_litertlm == 'true' || github.event.inputs.use_all == 'true') && 'true' || 'false' }}${{ github.event.inputs.litertlm_version != '' && format(' -PlitertlmVersion={0}', github.event.inputs.litertlm_version) || '' }} -PuseIntegrity=${{ (github.event.inputs.use_integrity == 'true' || github.event.inputs.use_all == 'true') && 'true' || 'false' }}${{ github.event.inputs.integrity_cloud_project != '' && format(' -PintegrityCloudProject={0}', github.event.inputs.integrity_cloud_project) || '' }} -PversionCode=${{ github.run_number }}${{ github.event.inputs.play_release == 'true' && ' -PplayRelease=true' || '' }}
 
       # R31: Google Play chặn bản cập nhật có thư viện native căn chỉnh 4 KB (hạn 01/02/2027). Không chặn APK tester, chỉ báo vào Summary.
       - name: Kiểm tra căn chỉnh 16 KB của thư viện native trong APK
@@ -425,3 +467,112 @@ jobs:
           name: AIPhotoStudio-play-api36-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+  # R36: job ĐO HIỆU NĂNG, KHÔNG chặn. Bản tester là assembleDebug, mà Compose ở bản debug chậm hơn đáng kể (debuggable, không R8, không hồ sơ baseline của thư viện Compose),
+  # nên "giật lag" trên máy có thể phần lớn do build debug. Job này dựng thêm bản `perf` (không debuggable, ký cùng khóa debug cố định ⇒ cài ĐÈ được lên bản tester) và xuất
+  # báo cáo Compose compiler (composable nào không bỏ qua được khi tái vẽ). Tải artifact `AIPhotoStudio-perf-apk`, so độ mượt với bản debug cùng máy; dán phần "Báo cáo Compose compiler"
+  # trong Summary của lần chạy vào chat để quyết định có tách EditorScreen hay không. Lỗi ở đây KHÔNG làm hỏng bản tester.
+  build-perf:
+    needs: [build-sd-server]
+    if: ${{ !cancelled() }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Giải nén gói zip dự án nếu có ở gốc repo (chỉ cần up zip lên là đủ)
+        run: |
+          # R34d: GitHub chỉ đọc file workflow từ chính repo, còn MỌI thứ khác có thể nằm trong zip. Zip ghi đè lên workspace (zip thắng tệp lẻ cũ);
+          # chịu được zip có/không có thư mục bọc; nhiều zip thì giải nén theo thứ tự tên (sort -V), zip tên "lớn" nhất thắng.
+          shopt -s nullglob
+          found=0
+          while IFS= read -r -d '' z; do
+            [ -n "$z" ] || continue
+            listing=$(unzip -l "$z" 2>/dev/null || true)
+            if ! grep -qE '(^|[ /])settings\.gradle\.kts$' <<<"$listing"; then
+              echo "Bỏ qua $z (không phải gói dự án: không có settings.gradle.kts)"; continue
+            fi
+            found=$((found+1))
+            echo "Giải nén $z vào workspace (ghi đè tệp trùng)"
+            tmp=$(mktemp -d)
+            unzip -oq "$z" -d "$tmp"
+            rm -rf "$tmp/__MACOSX"
+            sg=$(find "$tmp" -maxdepth 3 -name settings.gradle.kts -printf '%d %p\n' | sort -n | head -n1 | cut -d' ' -f2-)
+            root=$(dirname "$sg")
+            if [ -f "$root/.github/workflows/build-apk.yml" ] && ! cmp -s "$root/.github/workflows/build-apk.yml" .github/workflows/build-apk.yml; then
+              echo "::notice title=Workflow trong repo khác bản trong zip::GitHub chỉ đọc workflow từ chính repo, nên bản trong zip chưa có hiệu lực. Hãy thay .github/workflows/build-apk.yml trong repo bằng bản trong zip (hoặc bản build-apk.yml đi kèm) để dùng bản mới nhất."
+            fi
+            rm -rf "$root/.github"
+            cp -a "$root"/. ./
+            rm -rf "$tmp"
+          done < <(printf '%s\0' ./*.zip | sort -zV)
+          if [ "$found" -eq 0 ]; then echo "Không có gói zip dự án ở gốc repo - dùng nguyên nội dung repo."; fi
+
+      - name: Lấy sd-server đã biên dịch (nếu có)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: sd-server-arm64
+          path: app/src/main/jniLibs/arm64-v8a
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+      - name: Build bản ĐO HIỆU NĂNG (không debuggable) kèm báo cáo Compose compiler
+        run: gradle :app:assemblePerf --build-cache --stacktrace -PcomposeCompilerReports=true -PversionCode=${{ github.run_number }}
+
+      - name: Tóm tắt báo cáo Compose compiler (composable không bỏ qua được, lớp không ổn định)
+        continue-on-error: true
+        run: python3 tools/compose_report_summary.py app/build/compose_compiler | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AIPhotoStudio-perf-apk
+          path: app/build/outputs/apk/perf/*.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: compose-compiler-reports
+          path: app/build/compose_compiler
+          if-no-files-found: warn
+
+      # R8 (tùy chọn): chỉ khi bật perf_r8 khi bấm Run workflow. Lỗi ở đây KHÔNG ảnh hưởng gì khác; luôn tải chẩn đoán để lấy missing_rules.txt
+      - name: Build bản perf CÓ R8 (thử nghiệm)
+        id: perf_r8
+        if: ${{ github.event.inputs.perf_r8 == 'true' }}
+        continue-on-error: true
+        run: gradle :app:assemblePerf --stacktrace -PperfMinify=true -PversionCode=${{ github.run_number }}
+
+      - name: Đổi tên APK perf-r8
+        if: ${{ github.event.inputs.perf_r8 == 'true' && steps.perf_r8.outcome == 'success' }}
+        run: cp app/build/outputs/apk/perf/app-perf.apk app/build/outputs/apk/perf/app-perf-r8.apk
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ github.event.inputs.perf_r8 == 'true' && steps.perf_r8.outcome == 'success' }}
+        with:
+          name: AIPhotoStudio-perf-r8-apk
+          path: app/build/outputs/apk/perf/app-perf-r8.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && github.event.inputs.perf_r8 == 'true' }}
+        continue-on-error: true
+        with:
+          name: perf-r8-diagnostics
+          path: |
+            app/build/outputs/mapping/perf/missing_rules.txt
+            app/build/outputs/mapping/perf/configuration.txt
+            app/build/outputs/mapping/perf/usage.txt
+          if-no-files-found: ignore
