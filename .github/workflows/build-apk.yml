@@ -260,6 +260,17 @@ jobs:
           if [ "$rc" = 0 ]; then echo "AAR thật: đạt"
           elif [ "$rc" = 3 ]; then echo "::warning title=AAR thật::không tải được AAR nào (mạng?) - bỏ qua"
           else echo "::warning title=AAR thật::LỖI biên dịch với thư viện thật - bản build bật cờ tương ứng có thể đỏ, xem Summary"; exit 1; fi
+      - name: Kiểm bộ tải model với GitHub THẬT (không chặn)
+        # R43: JUnit chỉ thử ModelDownloader / ModelHub với máy chủ cục bộ. Bước này chạy chính các lớp đó với GitHub thật: HTTPS, chuyển hướng sang
+        # release-assets.githubusercontent.com, HỦY rồi TIẾP TỤC bằng Range, SHA-256 sai, lùi sang địa chỉ dự phòng khi Release 404. Không chặn.
+        if: ${{ hashFiles('tools/jvm_check/real_dl/check_real_download.sh') != '' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          bash tools/jvm_check/real_dl/check_real_download.sh 2>&1 | tail -30 | tee /tmp/real_dl.txt
+          { echo "### Tải model thật từ GitHub"; echo '```'; cat /tmp/real_dl.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if grep -q "TẤT CẢ ĐẠT" /tmp/real_dl.txt; then echo "tải model thật: đạt"; else echo "::warning title=Tải model thật::bộ tải model không đạt khi chạy với GitHub thật - xem Summary"; exit 1; fi
       - name: Bỏ qua jvm-check (repo không có tools/jvm_check)
         if: ${{ hashFiles('tools/jvm_check/run_all.sh') == '' }}
         run: echo "::warning title=Bỏ qua jvm-check::Repo không có tools/jvm_check/run_all.sh - tải thư mục tools/ lên. Xem job repo-check."
@@ -313,6 +324,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      - name: Gắn kho model vào danh mục model có sẵn trong app (R43)
+        # Thay __REPO__ bằng chủ/kho thật để app biết tải danh mục mới nhất từ Release (xem tools/models/mirror_models.py). Biến repo MODELS_REPO ghi đè khi model nằm ở kho khác.
+        env:
+          MODELS_REPO: ${{ vars.MODELS_REPO || github.repository }}
+        run: sed -i "s#__REPO__#${MODELS_REPO}#g" app/src/main/assets/model_catalog.json
       - name: Giải nén gói zip dự án nếu có ở gốc repo (chỉ cần up zip lên là đủ)
         run: |
           # R34d: GitHub chỉ đọc file workflow từ chính repo, còn MỌI thứ khác có thể nằm trong zip. Zip ghi đè lên workspace (zip thắng tệp lẻ cũ);
@@ -368,6 +384,11 @@ jobs:
       - name: Unit tests
         continue-on-error: true
         run: gradle :app:testDebugUnitTest --build-cache --stacktrace
+      - name: Tóm tắt kết quả Unit tests (bài nào hỏng, vì sao)
+        # R42: bước trên không chặn nên một bài đỏ chỉ để lại chú thích "Process completed with exit code 1" mà không nói bài nào. Bước này đọc XML của Gradle và ghi vào Summary.
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: python3 tools/junit_summary.py app/build/test-results/testDebugUnitTest | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Build debug APK
         run: gradle :app:assembleDebug --build-cache --stacktrace -PuseQnn=${{ github.event.inputs.use_qnn || 'false' }} -PuseBilling=${{ (github.event.inputs.use_billing == 'true' || github.event.inputs.use_all == 'true') && 'true' || 'false' }}${{ vars.BILLING_VERSION != '' && format(' -PbillingVersion={0}', vars.BILLING_VERSION) || '' }} -PuseLiteRtLm=${{ (github.event.inputs.use_litertlm == 'true' || github.event.inputs.use_all == 'true') && 'true' || 'false' }}${{ github.event.inputs.litertlm_version != '' && format(' -PlitertlmVersion={0}', github.event.inputs.litertlm_version) || '' }} -PuseIntegrity=${{ (github.event.inputs.use_integrity == 'true' || github.event.inputs.use_all == 'true') && 'true' || 'false' }}${{ github.event.inputs.integrity_cloud_project != '' && format(' -PintegrityCloudProject={0}', github.event.inputs.integrity_cloud_project) || '' }} -PversionCode=${{ github.run_number }}${{ github.event.inputs.play_release == 'true' && ' -PplayRelease=true' || '' }}
@@ -380,15 +401,33 @@ jobs:
       # R32: in phiên bản THẬT của các thư viện chính đã được Gradle giải quyết (kể cả `latest.release` của LiteRT-LM) để ghim bằng ô `litertlm_version`
       # mà không phải đoán số phiên bản. Chỉ báo vào Summary, không chặn.
       - name: Ghi phiên bản thư viện đã giải quyết
+        if: ${{ !cancelled() }}
         continue-on-error: true
         run: |
           {
             echo "### Phiên bản thư viện đã giải quyết (debugRuntimeClasspath)"
             echo '```'
             gradle :app:dependencies --configuration debugRuntimeClasspath $PFLAGS 2>/dev/null \
-              | grep -E 'litertlm|onnxruntime|mediapipe|billing|play:integrity|androidx.compose.ui:ui:|androidx.activity:activity' \
+              | grep -E 'litertlm|onnxruntime|mediapipe|billing|play:integrity|androidx.compose.ui:ui:|androidx.activity:activity|androidx.lifecycle:lifecycle-(runtime|viewmodel)-compose|androidx.core:core' \
               | sed -E 's/^[| +\\-]*//' | sort -u
             echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # R47: lần chạy bật use_all đỏ ở checkDebugAarMetadata (14 mục: Compose ui 1.9.0, lifecycle 2.10.0, core 1.15.0 đòi compileSdk 35 / AGP 8.6) mà log không
+      # nói THƯ VIỆN NÀO kéo chúng. Bước này CHỈ chạy khi có bước lỗi và ghi vào Summary chuỗi phụ thuộc để biết chính xác (app/build.gradle.kts đã có
+      # biện pháp ghim về bản đã kiểm khi bật thư viện tùy chọn — nếu vẫn đỏ, đây là chỗ đọc nguyên nhân).
+      - name: Chẩn đoán - thư viện nào kéo androidx bản mới
+        if: ${{ failure() }}
+        continue-on-error: true
+        run: |
+          {
+            echo "### Ai kéo androidx bản mới (dependencyInsight, debugRuntimeClasspath)"
+            for dep in androidx.compose.ui:ui androidx.lifecycle:lifecycle-runtime-compose androidx.core:core; do
+              echo "#### $dep"
+              echo '```'
+              gradle :app:dependencyInsight --configuration debugRuntimeClasspath --dependency "$dep" $PFLAGS 2>&1 | head -60
+              echo '```'
+            done
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v6
@@ -409,6 +448,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      - name: Gắn kho model vào danh mục model có sẵn trong app (R43)
+        # Thay __REPO__ bằng chủ/kho thật để app biết tải danh mục mới nhất từ Release (xem tools/models/mirror_models.py). Biến repo MODELS_REPO ghi đè khi model nằm ở kho khác.
+        env:
+          MODELS_REPO: ${{ vars.MODELS_REPO || github.repository }}
+        run: sed -i "s#__REPO__#${MODELS_REPO}#g" app/src/main/assets/model_catalog.json
       - name: Giải nén gói zip dự án nếu có ở gốc repo (chỉ cần up zip lên là đủ)
         run: |
           # R34d: GitHub chỉ đọc file workflow từ chính repo, còn MỌI thứ khác có thể nằm trong zip. Zip ghi đè lên workspace (zip thắng tệp lẻ cũ);
@@ -482,6 +526,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      - name: Gắn kho model vào danh mục model có sẵn trong app (R43)
+        # Thay __REPO__ bằng chủ/kho thật để app biết tải danh mục mới nhất từ Release (xem tools/models/mirror_models.py). Biến repo MODELS_REPO ghi đè khi model nằm ở kho khác.
+        env:
+          MODELS_REPO: ${{ vars.MODELS_REPO || github.repository }}
+        run: sed -i "s#__REPO__#${MODELS_REPO}#g" app/src/main/assets/model_catalog.json
       - name: Giải nén gói zip dự án nếu có ở gốc repo (chỉ cần up zip lên là đủ)
         run: |
           # R34d: GitHub chỉ đọc file workflow từ chính repo, còn MỌI thứ khác có thể nằm trong zip. Zip ghi đè lên workspace (zip thắng tệp lẻ cũ);
@@ -531,7 +580,7 @@ jobs:
           cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
 
       - name: Build bản ĐO HIỆU NĂNG (không debuggable) kèm báo cáo Compose compiler
-        run: gradle :app:assemblePerf --build-cache --stacktrace -PcomposeCompilerReports=true -PversionCode=${{ github.run_number }}
+        run: gradle :app:assemblePerf --build-cache --stacktrace -PcomposeCompilerReports=true -Pkotlin.caching.enabled=false -PversionCode=${{ github.run_number }}
 
       - name: Tóm tắt báo cáo Compose compiler (composable không bỏ qua được, lớp không ổn định)
         continue-on-error: true
