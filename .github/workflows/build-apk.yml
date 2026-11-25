@@ -88,6 +88,7 @@ jobs:
             rm -rf "$tmp"
           done < <(printf '%s\0' ./*.zip | sort -zV)
           if [ "$found" -eq 0 ]; then echo "Không có gói zip dự án ở gốc repo - dùng nguyên nội dung repo."; fi
+
       - name: Đối chiếu repo với danh sách tệp của gói dự án
         run: |
           python3 - <<'PY'
@@ -159,6 +160,7 @@ jobs:
             rm -rf "$tmp"
           done < <(printf '%s\0' ./*.zip | sort -zV)
           if [ "$found" -eq 0 ]; then echo "Không có gói zip dự án ở gốc repo - dùng nguyên nội dung repo."; fi
+
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -211,6 +213,7 @@ jobs:
             rm -rf "$tmp"
           done < <(printf '%s\0' ./*.zip | sort -zV)
           if [ "$found" -eq 0 ]; then echo "Không có gói zip dự án ở gốc repo - dùng nguyên nội dung repo."; fi
+
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -324,11 +327,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - name: Gắn kho model vào danh mục model có sẵn trong app (R43)
-        # Thay __REPO__ bằng chủ/kho thật để app biết tải danh mục mới nhất từ Release (xem tools/models/mirror_models.py). Biến repo MODELS_REPO ghi đè khi model nằm ở kho khác.
-        env:
-          MODELS_REPO: ${{ vars.MODELS_REPO || github.repository }}
-        run: sed -i "s#__REPO__#${MODELS_REPO}#g" app/src/main/assets/model_catalog.json
       - name: Giải nén gói zip dự án nếu có ở gốc repo (chỉ cần up zip lên là đủ)
         run: |
           # R34d: GitHub chỉ đọc file workflow từ chính repo, còn MỌI thứ khác có thể nằm trong zip. Zip ghi đè lên workspace (zip thắng tệp lẻ cũ);
@@ -356,6 +354,21 @@ jobs:
             rm -rf "$tmp"
           done < <(printf '%s\0' ./*.zip | sort -zV)
           if [ "$found" -eq 0 ]; then echo "Không có gói zip dự án ở gốc repo - dùng nguyên nội dung repo."; fi
+
+      - name: Gắn kho model vào danh mục model có sẵn trong app (R43; R48 chuyển xuống SAU bước giải nén)
+        # R48: bước này TRƯỚC ĐÂY nằm trước bước giải nén zip nên khi repo chỉ có AIPhotoStudio.zip ở gốc thì chưa có
+        # app/src/main/assets/model_catalog.json => "sed: can't read ... No such file or directory" (Build APK #35, job build-play).
+        # Thay __REPO__ bằng chủ/kho thật để app biết tải danh mục mới nhất từ Release (xem tools/models/mirror_models.py). Biến repo MODELS_REPO ghi đè khi model nằm ở kho khác.
+        env:
+          MODELS_REPO: ${{ vars.MODELS_REPO || github.repository }}
+        run: |
+          f=app/src/main/assets/model_catalog.json
+          if [ -f "$f" ]; then
+            sed -i "s#__REPO__#${MODELS_REPO}#g" "$f"
+            echo "Đã gắn kho model: ${MODELS_REPO}"
+          else
+            echo "::warning title=Không thấy model_catalog.json::Không có $f sau bước giải nén - bỏ qua việc gắn kho model (app vẫn dùng danh mục có sẵn trong gói nếu có)."
+          fi
 
       - name: Lấy sd-server đã biên dịch (nếu có)
         uses: actions/download-artifact@v7
@@ -448,11 +461,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - name: Gắn kho model vào danh mục model có sẵn trong app (R43)
-        # Thay __REPO__ bằng chủ/kho thật để app biết tải danh mục mới nhất từ Release (xem tools/models/mirror_models.py). Biến repo MODELS_REPO ghi đè khi model nằm ở kho khác.
-        env:
-          MODELS_REPO: ${{ vars.MODELS_REPO || github.repository }}
-        run: sed -i "s#__REPO__#${MODELS_REPO}#g" app/src/main/assets/model_catalog.json
       - name: Giải nén gói zip dự án nếu có ở gốc repo (chỉ cần up zip lên là đủ)
         run: |
           # R34d: GitHub chỉ đọc file workflow từ chính repo, còn MỌI thứ khác có thể nằm trong zip. Zip ghi đè lên workspace (zip thắng tệp lẻ cũ);
@@ -480,6 +488,21 @@ jobs:
             rm -rf "$tmp"
           done < <(printf '%s\0' ./*.zip | sort -zV)
           if [ "$found" -eq 0 ]; then echo "Không có gói zip dự án ở gốc repo - dùng nguyên nội dung repo."; fi
+
+      - name: Gắn kho model vào danh mục model có sẵn trong app (R43; R48 chuyển xuống SAU bước giải nén)
+        # R48: bước này TRƯỚC ĐÂY nằm trước bước giải nén zip nên khi repo chỉ có AIPhotoStudio.zip ở gốc thì chưa có
+        # app/src/main/assets/model_catalog.json => "sed: can't read ... No such file or directory" (Build APK #35, job build-play).
+        # Thay __REPO__ bằng chủ/kho thật để app biết tải danh mục mới nhất từ Release (xem tools/models/mirror_models.py). Biến repo MODELS_REPO ghi đè khi model nằm ở kho khác.
+        env:
+          MODELS_REPO: ${{ vars.MODELS_REPO || github.repository }}
+        run: |
+          f=app/src/main/assets/model_catalog.json
+          if [ -f "$f" ]; then
+            sed -i "s#__REPO__#${MODELS_REPO}#g" "$f"
+            echo "Đã gắn kho model: ${MODELS_REPO}"
+          else
+            echo "::warning title=Không thấy model_catalog.json::Không có $f sau bước giải nén - bỏ qua việc gắn kho model (app vẫn dùng danh mục có sẵn trong gói nếu có)."
+          fi
 
       - name: Lấy sd-server đã biên dịch (nếu có)
         uses: actions/download-artifact@v7
@@ -526,11 +549,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - name: Gắn kho model vào danh mục model có sẵn trong app (R43)
-        # Thay __REPO__ bằng chủ/kho thật để app biết tải danh mục mới nhất từ Release (xem tools/models/mirror_models.py). Biến repo MODELS_REPO ghi đè khi model nằm ở kho khác.
-        env:
-          MODELS_REPO: ${{ vars.MODELS_REPO || github.repository }}
-        run: sed -i "s#__REPO__#${MODELS_REPO}#g" app/src/main/assets/model_catalog.json
       - name: Giải nén gói zip dự án nếu có ở gốc repo (chỉ cần up zip lên là đủ)
         run: |
           # R34d: GitHub chỉ đọc file workflow từ chính repo, còn MỌI thứ khác có thể nằm trong zip. Zip ghi đè lên workspace (zip thắng tệp lẻ cũ);
@@ -558,6 +576,21 @@ jobs:
             rm -rf "$tmp"
           done < <(printf '%s\0' ./*.zip | sort -zV)
           if [ "$found" -eq 0 ]; then echo "Không có gói zip dự án ở gốc repo - dùng nguyên nội dung repo."; fi
+
+      - name: Gắn kho model vào danh mục model có sẵn trong app (R43; R48 chuyển xuống SAU bước giải nén)
+        # R48: bước này TRƯỚC ĐÂY nằm trước bước giải nén zip nên khi repo chỉ có AIPhotoStudio.zip ở gốc thì chưa có
+        # app/src/main/assets/model_catalog.json => "sed: can't read ... No such file or directory" (Build APK #35, job build-play).
+        # Thay __REPO__ bằng chủ/kho thật để app biết tải danh mục mới nhất từ Release (xem tools/models/mirror_models.py). Biến repo MODELS_REPO ghi đè khi model nằm ở kho khác.
+        env:
+          MODELS_REPO: ${{ vars.MODELS_REPO || github.repository }}
+        run: |
+          f=app/src/main/assets/model_catalog.json
+          if [ -f "$f" ]; then
+            sed -i "s#__REPO__#${MODELS_REPO}#g" "$f"
+            echo "Đã gắn kho model: ${MODELS_REPO}"
+          else
+            echo "::warning title=Không thấy model_catalog.json::Không có $f sau bước giải nén - bỏ qua việc gắn kho model (app vẫn dùng danh mục có sẵn trong gói nếu có)."
+          fi
 
       - name: Lấy sd-server đã biên dịch (nếu có)
         uses: actions/download-artifact@v7
