@@ -451,12 +451,37 @@ jobs:
             # R49: lỗi Compose "makeComposableAnnotation" (NPE) = androidx.compose.runtime.Composable không có trên classpath BIÊN DỊCH => in classpath biên dịch + ai kéo runtime
             echo "### Classpath BIÊN DỊCH (debugCompileClasspath): các tệp compose / lifecycle / core / litertlm"
             echo '```'
-            gradle :app:printCompileClasspath -q $PFLAGS 2>&1 | grep -i -E 'compose|lifecycle|core-|litertlm|annotation' | head -80
+            gradle :app:printCompileClasspath -q $PFLAGS 2>&1 | grep -i -E 'compose|lifecycle|core-|litertlm|annotation|kotlin|coroutines|gson|billing|integrity|onnxruntime|activity|savedstate' | head -120
             echo '```'
             echo "#### dependencyInsight androidx.compose.runtime:runtime (debugCompileClasspath)"
             echo '```'
             gradle :app:dependencyInsight --configuration debugCompileClasspath --dependency androidx.compose.runtime:runtime $PFLAGS 2>&1 | head -80
             echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # R50: Build APK #43 (use_all) vẫn đỏ NPE `makeComposableAnnotation` sau R49 và mình KHÔNG có Gradle / Maven trong sandbox để tự thử. Bước này làm thay: khi lần dựng có
+      # bật cờ tùy chọn mà đỏ, nó biên dịch Kotlin lần lượt với từng cờ RIÊNG rồi ghi vào Summary cờ nào xanh / cờ nào đỏ (kèm dòng lỗi đầu tiên) -
+      # đó là dữ liệu để sửa đúng chỗ ở lượt sau. Chỉ chạy khi lỗi, không chặn, tối đa 25 phút.
+      - name: Bisect - cờ tùy chọn nào làm biên dịch Kotlin hỏng (R50)
+        if: ${{ failure() && (github.event.inputs.use_all == 'true' || github.event.inputs.use_billing == 'true' || github.event.inputs.use_litertlm == 'true' || github.event.inputs.use_integrity == 'true' || github.event.inputs.use_qnn == 'true') }}
+        continue-on-error: true
+        timeout-minutes: 25
+        run: |
+          {
+            echo "### Bisect (R50): compileDebugKotlin với TỪNG cờ riêng"
+            echo ""
+            echo "| cờ | kết quả |"
+            echo "|---|---|"
+            for f in none useQnn useBilling useLiteRtLm useIntegrity; do
+              args=""
+              if [ "$f" != "none" ]; then args="-P$f=true"; fi
+              if gradle :app:compileDebugKotlin --build-cache -q $args -PversionCode=${{ github.run_number }} > "/tmp/bisect_$f.log" 2>&1; then
+                r="xanh"
+              else
+                r="ĐỎ: $(grep -m1 -E '^e: |NullPointerException|Unsupported class|What went wrong' "/tmp/bisect_$f.log" | cut -c1-220)"
+              fi
+              echo "| $f | $r |"
+            done
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v6
