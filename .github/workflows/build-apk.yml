@@ -23,7 +23,7 @@ on:
         type: boolean
         default: false
       litertlm_version:
-        description: "Phiên bản com.google.ai.edge.litertlm:litertlm-android (để trống = latest.release; hãy ghim sau khi build thử OK)"
+        description: "Phiên bản com.google.ai.edge.litertlm:litertlm-android (để trống = CI tự chọn bản mới nhất mà D8 đọc được, dự phòng 0.18.1 - xem tools/pick_litertlm_version.py)"
         type: string
         default: ""
       use_integrity:
@@ -403,6 +403,13 @@ jobs:
         continue-on-error: true
         run: python3 tools/junit_summary.py app/build/test-results/testDebugUnitTest | tee -a "$GITHUB_STEP_SUMMARY"
 
+      - name: Chọn phiên bản LiteRT-LM mà D8 của AGP đọc được (R49)
+        # R49: Build APK #39 đỏ vì litertlm-android 0.20.0 chứa bytecode Java 25 (class major 69) - D8 của AGP 8.5.2 không đọc. Script tải maven-metadata.xml từ Google Maven,
+        # đọc major của mọi lớp trong AAR từ bản mới đến cũ (khoảng 0.18.0 <= v < 0.21.0 đã kiểm API với mã thật) và chọn bản mới nhất đạt; ghi ORG_GRADLE_PROJECT_litertlmVersion.
+        # Bỏ qua khi bạn tự điền ô litertlm_version. Không tải được thì dùng 0.18.1 kèm cảnh báo.
+        if: ${{ (github.event.inputs.use_litertlm == 'true' || github.event.inputs.use_all == 'true') && github.event.inputs.litertlm_version == '' }}
+        run: python3 tools/pick_litertlm_version.py
+
       - name: Build debug APK
         run: gradle :app:assembleDebug --build-cache --stacktrace -PuseQnn=${{ github.event.inputs.use_qnn || 'false' }} -PuseBilling=${{ (github.event.inputs.use_billing == 'true' || github.event.inputs.use_all == 'true') && 'true' || 'false' }}${{ vars.BILLING_VERSION != '' && format(' -PbillingVersion={0}', vars.BILLING_VERSION) || '' }} -PuseLiteRtLm=${{ (github.event.inputs.use_litertlm == 'true' || github.event.inputs.use_all == 'true') && 'true' || 'false' }}${{ github.event.inputs.litertlm_version != '' && format(' -PlitertlmVersion={0}', github.event.inputs.litertlm_version) || '' }} -PuseIntegrity=${{ (github.event.inputs.use_integrity == 'true' || github.event.inputs.use_all == 'true') && 'true' || 'false' }}${{ github.event.inputs.integrity_cloud_project != '' && format(' -PintegrityCloudProject={0}', github.event.inputs.integrity_cloud_project) || '' }} -PversionCode=${{ github.run_number }}${{ github.event.inputs.play_release == 'true' && ' -PplayRelease=true' || '' }}
 
@@ -441,6 +448,15 @@ jobs:
               gradle :app:dependencyInsight --configuration debugRuntimeClasspath --dependency "$dep" $PFLAGS 2>&1 | head -60
               echo '```'
             done
+            # R49: lỗi Compose "makeComposableAnnotation" (NPE) = androidx.compose.runtime.Composable không có trên classpath BIÊN DỊCH => in classpath biên dịch + ai kéo runtime
+            echo "### Classpath BIÊN DỊCH (debugCompileClasspath): các tệp compose / lifecycle / core / litertlm"
+            echo '```'
+            gradle :app:printCompileClasspath -q $PFLAGS 2>&1 | grep -i -E 'compose|lifecycle|core-|litertlm|annotation' | head -80
+            echo '```'
+            echo "#### dependencyInsight androidx.compose.runtime:runtime (debugCompileClasspath)"
+            echo '```'
+            gradle :app:dependencyInsight --configuration debugCompileClasspath --dependency androidx.compose.runtime:runtime $PFLAGS 2>&1 | head -80
+            echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v6
