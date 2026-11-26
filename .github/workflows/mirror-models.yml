@@ -1,0 +1,69 @@
+name: Mirror models
+
+# R43: nạp model AI vào GitHub Release của kho (miễn phí, không hết hạn, hỗ trợ tải tiếp) cho trình tải model trong app.
+# Chạy MỘT LẦN sau khi đẩy mã (và chạy lại khi thêm model mới vào tools/models/sources.json): Actions → Mirror models → Run workflow.
+# Điều kiện: kho phải CÔNG KHAI (người dùng app tải trực tiếp từ Release). Kho riêng: tạo một kho công khai khác chỉ để chứa model, đặt biến repo
+# MODELS_REPO = "chu/kho-model" và secret MODELS_REPO_TOKEN (token có quyền "contents: write" trên kho đó).
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "id model cần nạp, cách nhau dấu phẩy (bỏ trống = tất cả). Danh sách id: tools/models/sources.json"
+        type: string
+        default: ""
+      tag:
+        description: "Tên Release chứa model. App đọc models-v1 — đừng đổi trừ khi biết rõ"
+        type: string
+        default: "models-v1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-models
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Giải nén gói zip dự án nếu có ở gốc repo (R48 - workflow này cần tools/models/ nằm TRONG zip)
+        run: |
+          # R48: khi repo chỉ có AIPhotoStudio.zip ở gốc thì tools/models/mirror_models.py chưa tồn tại sau checkout =>
+          # "can't open file ... mirror_models.py". Cùng cách giải nén với workflow Build APK (zip ghi đè workspace, bỏ .github/ và __MACOSX).
+          shopt -s nullglob
+          found=0
+          while IFS= read -r -d '' z; do
+            [ -n "$z" ] || continue
+            listing=$(unzip -l "$z" 2>/dev/null || true)
+            if ! grep -qE '(^|[ /])settings\.gradle\.kts$' <<<"$listing"; then
+              echo "Bỏ qua $z (không phải gói dự án: không có settings.gradle.kts)"; continue
+            fi
+            found=$((found+1))
+            echo "Giải nén $z vào workspace (ghi đè tệp trùng)"
+            tmp=$(mktemp -d)
+            unzip -oq "$z" -d "$tmp"
+            rm -rf "$tmp/__MACOSX"
+            sg=$(find "$tmp" -maxdepth 3 -name settings.gradle.kts -printf '%d %p\n' | sort -n | head -n1 | cut -d' ' -f2-)
+            root=$(dirname "$sg")
+            rm -rf "$root/.github"
+            cp -a "$root"/. ./
+            rm -rf "$tmp"
+          done < <(printf '%s\0' ./*.zip | sort -zV)
+          if [ "$found" -eq 0 ]; then echo "Không có gói zip dự án ở gốc repo - dùng nguyên nội dung repo."; fi
+          test -f tools/models/mirror_models.py || { echo "::error title=Thiếu tools/models/mirror_models.py::Repo không có mã nguồn (không có zip dự án và không có tools/models/). Hãy tải AIPhotoStudio.zip lên gốc repo rồi chạy lại."; exit 1; }
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Cài onnx và numpy (dựng Real-ESRGAN từ trọng số chính thức)
+        run: python -m pip install --quiet onnx numpy
+      - name: Tải model từ nguồn, kiểm SHA-256, đẩy lên Release và sinh catalog.json
+        env:
+          GH_TOKEN: ${{ secrets.MODELS_REPO_TOKEN || github.token }}
+          MODELS_REPO: ${{ vars.MODELS_REPO || github.repository }}
+          ONLY: ${{ inputs.only }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          python tools/models/mirror_models.py --repo "$MODELS_REPO" --tag "$TAG" --out "$RUNNER_TEMP/models" ${ONLY:+--only "$ONLY"}
